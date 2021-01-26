@@ -398,6 +398,19 @@ class LoadProposals(object):
     def __init__(self, num_max_proposals=None):
         self.num_max_proposals = num_max_proposals
 
+    def unique_boxes(self, boxes):
+        v = np.array([1, 1e3, 1e6, 1e9])
+        hashes = np.round(boxes * 0.125).dot(v)
+        _, index = np.unique(hashes, return_index=True)
+        return boxes[index]
+
+    def filter_small_boxes(self, boxes):
+        min_size = 20
+        w = boxes[:, 2] - boxes[:, 0] + 1
+        h = boxes[:, 3] - boxes[:, 1] + 1
+        keep = np.where((w > min_size) & (h > min_size))[0]
+        return boxes[keep]
+
     def __call__(self, results):
         """Call function to load proposals from file.
 
@@ -414,6 +427,11 @@ class LoadProposals(object):
                 'proposals should have shapes (n, 4) or (n, 5), '
                 f'but found {proposals.shape}')
         proposals = proposals[:, :4]
+
+        proposals = self.filter_small_boxes(proposals)
+        proposals = self.unique_boxes(proposals)
+
+
 
         if self.num_max_proposals is not None:
             proposals = proposals[:self.num_max_proposals]
@@ -456,3 +474,66 @@ class FilterAnnotations(object):
                 if key in results:
                     results[key] = results[key][keep]
             return results
+
+
+@PIPELINES.register_module()
+class LoadWeakAnnotations(object):
+    def __init__(self,
+                 num_classes=20,
+                 file_client_args=dict(backend='disk')):
+        self.file_client_args = file_client_args.copy()
+        self.file_client = None
+        self.num_classes = num_classes
+
+    def _load_labels(self, results):
+        labels = results['ann_info']['labels'].copy()
+        labels_onehot = np.zeros((20, ), dtype=np.int32)
+        for i in range(labels.shape[0]):
+            labels_onehot[labels[i]] = 1
+        
+        results['gt_labels'] = labels_onehot
+        return results
+
+    def __call__(self, results):
+        results = self._load_labels(results)
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'with_label={self.with_label}, '
+        return repr_str
+
+
+
+@PIPELINES.register_module()
+class LoadSuperPixelFromFile(object):
+    def __init__(self,
+                 color_type='color',
+                 file_client_args=dict(backend='disk')):
+        self.color_type = color_type
+        self.file_client_args = file_client_args.copy()
+        self.file_client = None
+
+    def __call__(self, results):
+        if self.file_client is None:
+            self.file_client = mmcv.FileClient(**self.file_client_args)
+
+        if results['img_prefix'] is not None:
+            filename = osp.join(results['img_prefix'],
+                                results['img_info']['ssname'])
+        else:
+            filename = results['img_info']['ssname']
+
+        img_bytes = self.file_client.get(filename)
+        img = mmcv.imfrombytes(img_bytes, flag=self.color_type)
+
+        results['ss'] = img
+        return results
+
+    def __repr__(self):
+        repr_str = (f'{self.__class__.__name__}('
+                    f'to_float32={self.to_float32}, '
+                    f"color_type='{self.color_type}', "
+                    f'file_client_args={self.file_client_args})')
+        return repr_str
+

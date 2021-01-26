@@ -231,6 +231,7 @@ class Resize(object):
                 bboxes[:, 1::2] = np.clip(bboxes[:, 1::2], 0, img_shape[0])
             results[key] = bboxes
 
+
     def _resize_masks(self, results):
         """Resize masks with ``results['scale']``"""
         for key in results.get('mask_fields', []):
@@ -408,7 +409,6 @@ class RandomFlip(object):
             dict: Flipped results, 'flip', 'flip_direction' keys are added \
                 into result dict.
         """
-
         if 'flip' not in results:
             if isinstance(self.direction, list):
                 # None means non-flip
@@ -1710,3 +1710,151 @@ class CutOut(object):
                      else f'cutout_shape={self.candidates}, ')
         repr_str += f'fill_in={self.fill_in})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class ResizeLong(object):
+    def __init__(self,
+                 img_scale=None,
+                 multiscale_mode='range',
+                 ratio_range=None,
+                 keep_ratio=True,
+                 bbox_clip_border=True,
+                 backend='cv2'):
+        if img_scale is None:
+            self.img_scale = None
+        else:
+            if isinstance(img_scale, list):
+                self.img_scale = img_scale
+            else:
+                self.img_scale = [img_scale]
+            assert mmcv.is_list_of(self.img_scale, tuple)
+
+        if ratio_range is not None:
+            # mode 1: given a scale and a range of image ratio
+            assert len(self.img_scale) == 1
+        else:
+            # mode 2: given multiple scales or a range of scales
+            assert multiscale_mode in ['value', 'range']
+
+        self.backend = backend
+        self.multiscale_mode = multiscale_mode
+        self.ratio_range = ratio_range
+        self.keep_ratio = keep_ratio
+        self.bbox_clip_border = bbox_clip_border
+
+    @staticmethod
+    def random_select(img_scales):
+        assert mmcv.is_list_of(img_scales, tuple)
+        scale_idx = np.random.randint(len(img_scales))
+        img_scale = img_scales[scale_idx]
+        return img_scale, scale_idx
+
+    @staticmethod
+    def random_sample(img_scales):
+        assert mmcv.is_list_of(img_scales, tuple) and len(img_scales) == 2
+        img_scale_long = [max(s) for s in img_scales]
+        img_scale_short = [min(s) for s in img_scales]
+        long_edge = np.random.randint(
+            min(img_scale_long),
+            max(img_scale_long) + 1)
+        short_edge = np.random.randint(
+            min(img_scale_short),
+            max(img_scale_short) + 1)
+        img_scale = (long_edge, short_edge)
+        return img_scale, None
+
+    @staticmethod
+    def random_sample_ratio(img_scale, ratio_range):
+        assert isinstance(img_scale, tuple) and len(img_scale) == 2
+        min_ratio, max_ratio = ratio_range
+        assert min_ratio <= max_ratio
+        ratio = np.random.random_sample() * (max_ratio - min_ratio) + min_ratio
+        scale = int(img_scale[0] * ratio), int(img_scale[1] * ratio)
+        return scale, None
+
+    def _random_scale(self, results):
+        if self.ratio_range is not None:
+            scale, scale_idx = self.random_sample_ratio(
+                self.img_scale[0], self.ratio_range)
+        elif len(self.img_scale) == 1:
+            scale, scale_idx = self.img_scale[0], 0
+        elif self.multiscale_mode == 'range':
+            scale, scale_idx = self.random_sample(self.img_scale)
+        elif self.multiscale_mode == 'value':
+            scale, scale_idx = self.random_select(self.img_scale)
+        else:
+            raise NotImplementedError
+
+        results['scale'] = scale
+        results['scale_idx'] = scale_idx
+
+    def _resize_img(self, results):
+        """Resize images with ``results['scale']``."""
+        for key in results.get('img_fields', ['img']):
+            if self.keep_ratio:
+                img, scale_factor = mmcv.imrescale(
+                    results[key],
+                    results['scale'],
+                    return_scale=True,
+                    backend=self.backend)
+                # the w_scale and h_scale has minor difference
+                # a real fix should be done in the mmcv.imrescale in the future
+                new_h, new_w = img.shape[:2]
+                h, w = results[key].shape[:2]
+                w_scale = new_w / w
+                h_scale = new_h / h
+            else:
+                img, w_scale, h_scale = mmcv.imresize(
+                    results[key],
+                    results['scale'],
+                    return_scale=True,
+                    backend=self.backend)
+            results[key] = img
+
+            scale_factor = np.array([w_scale, h_scale, w_scale, h_scale],
+                                    dtype=np.float32)
+            results['img_shape'] = img.shape
+            # in case that there is no padding
+            results['pad_shape'] = img.shape
+            results['scale_factor'] = scale_factor
+            results['keep_ratio'] = self.keep_ratio
+
+    def _resize_bboxes(self, results):
+        """Resize bounding boxes with ``results['scale_factor']``."""
+        for key in results.get('bbox_fields', []):
+            bboxes = results[key] * results['scale_factor']
+            if self.bbox_clip_border:
+                img_shape = results['img_shape']
+                bboxes[:, 0::2] = np.clip(bboxes[:, 0::2], 0, img_shape[1])
+                bboxes[:, 1::2] = np.clip(bboxes[:, 1::2], 0, img_shape[0])
+            results[key] = bboxes
+
+    def __call__(self, results):
+        if 'scale' not in results:
+            if 'scale_factor' in results:
+                img_shape = results['img'].shape[:2]
+                scale_factor = results['scale_factor']
+                assert isinstance(scale_factor, float)
+                results['scale'] = tuple(
+                    [int(x * scale_factor) for x in img_shape][::-1])
+            else:
+                self._random_scale(results)
+        else:
+            assert 'scale_factor' not in results, (
+                'scale and scale_factor cannot be both set.')
+
+        self._resize_img(results)
+        self._resize_bboxes(results)
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(img_scale={self.img_scale}, '
+        repr_str += f'multiscale_mode={self.multiscale_mode}, '
+        repr_str += f'ratio_range={self.ratio_range}, '
+        repr_str += f'keep_ratio={self.keep_ratio})'
+        repr_str += f'bbox_clip_border={self.bbox_clip_border})'
+        return repr_str
+
+
